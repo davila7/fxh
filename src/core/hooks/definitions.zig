@@ -171,6 +171,9 @@ pub const PostToolUseInput = struct {
     tool_name: []const u8,
     arguments_json: []const u8,
     output: []const u8,
+    /// The call ran and reported a failure, such as a command that exited
+    /// non-zero. A replacement keeps the call failed.
+    tool_failed: bool = false,
 };
 
 pub const ReplacedToolOutput = struct {

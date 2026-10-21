@@ -65,6 +65,7 @@ Each command receives one JSON object on stdin.
 | `tool_use_id` | both | the call id |
 | `agent_id` | both | subagent id, only inside a subagent |
 | `tool_response` | `PostToolUse` | the tool result text as the model would see it |
+| `tool_failed` | `PostToolUse` | true when the call ran and failed, such as a command that exited non-zero |
 
 ### PreToolUse output
 
@@ -76,10 +77,11 @@ Each command receives one JSON object on stdin.
 
 ### PostToolUse output
 
-`PostToolUse` runs only after a call that succeeded.
+`PostToolUse` runs after every call that ran to completion, including calls that failed (`tool_failed: true`), such as a shell command that exited non-zero. It does not run for a call that was refused or cancelled.
 
 - Exit code 0 with `{"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": "..."}}` replaces the result the model sees. A non-string value is sent as JSON text.
-- fxh extension: `"updatedToolOutputIsError": true` next to `updatedToolOutput` makes the result a failed call, in fx's standard failure shape with the given text as the message. Claude Code's hook output has no field for this.
+- fxh extension: `"updatedToolOutputIsError": true` next to `updatedToolOutput` makes the result of a successful call a failed call, in fx's standard failure shape with the given text as the message. Claude Code's hook output has no field for this.
+- A replacement for a failed call is used as given and the call stays failed.
 - A replaced result drops fx's stored preview and replay handle for the original output.
 
 ### Failures

@@ -227,7 +227,7 @@ fn preToolUse(self: *CommandHooks, input: hooks.PreToolUseInput) !hooks.PreToolU
     for (self.pre_tool_use) |group| {
         if (!group.matches(input.tool_name)) continue;
         for (group.commands) |command| {
-            const payload = try eventJson(arena, "PreToolUse", input.invocation, input.call_id, input.tool_name, arguments_json, null);
+            const payload = try eventJson(arena, "PreToolUse", input.invocation, input.call_id, input.tool_name, arguments_json, null, false);
             const result = runCommand(arena, command, input.invocation.scope.workspace_root, payload) orelse continue;
             switch (try parsePreToolUseResult(arena, result)) {
                 .none => {},
@@ -261,7 +261,7 @@ fn postToolUse(self: *CommandHooks, input: hooks.PostToolUseInput) !hooks.PostTo
     for (self.post_tool_use) |group| {
         if (!group.matches(input.tool_name)) continue;
         for (group.commands) |command| {
-            const payload = try eventJson(arena, "PostToolUse", input.invocation, input.call_id, input.tool_name, input.arguments_json, output);
+            const payload = try eventJson(arena, "PostToolUse", input.invocation, input.call_id, input.tool_name, input.arguments_json, output, input.tool_failed);
             const result = runCommand(arena, command, input.invocation.scope.workspace_root, payload) orelse continue;
             switch (try parsePostToolUseResult(arena, result)) {
                 .none => {},
@@ -290,6 +290,7 @@ fn eventJson(
     tool_name: []const u8,
     arguments_json: []const u8,
     tool_response: ?[]const u8,
+    tool_failed: bool,
 ) ![]const u8 {
     const tool_input = std.json.parseFromSliceLeaky(std.json.Value, arena, arguments_json, .{}) catch
         std.json.Value{ .object = .empty };
@@ -315,6 +316,8 @@ fn eventJson(
     if (tool_response) |text| {
         try stringify.objectField("tool_response");
         try stringify.write(text);
+        try stringify.objectField("tool_failed");
+        try stringify.write(tool_failed);
     }
     try stringify.endObject();
     return out.written();
@@ -579,6 +582,7 @@ test "commands receive the event on stdin and answer on stdout" {
         .tool_name = "read_file",
         .arguments_json = "{\"path\":\"a.txt\"}",
         .output = "1\thello",
+        .tool_failed = true,
     });
     try std.testing.expectEqualStrings("replaced", post.replace_output.output);
     var seen_file = try tmp.dir.openFile(io_mod.getIo(), "seen.json", .{});
@@ -590,5 +594,6 @@ test "commands receive the event on stdin and answer on stdout" {
     try std.testing.expectEqualStrings("PostToolUse", parsed.value.object.get("hook_event_name").?.string);
     try std.testing.expectEqualStrings("c3", parsed.value.object.get("tool_use_id").?.string);
     try std.testing.expectEqualStrings("1\thello", parsed.value.object.get("tool_response").?.string);
+    try std.testing.expect(parsed.value.object.get("tool_failed").?.bool);
     try std.testing.expectEqualStrings("a.txt", parsed.value.object.get("tool_input").?.object.get("path").?.string);
 }

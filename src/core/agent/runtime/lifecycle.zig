@@ -502,8 +502,9 @@ pub fn applyPostToolUse(
     execution: *tool_contracts.ToolExecutionResult,
 ) Allocator.Error!void {
     if (!lifecycle.view.hasPostToolUse()) return;
-    if (execution.cancelled or execution.status != .success) return;
+    if (execution.cancelled) return;
     if (execution.model_content_kind != .ordinary) return;
+    const tool_failed = execution.status != .success;
     var outcome = try lifecycle.view.runPostToolUse(lifecycle.outcome_allocator, .{
         .invocation = .{
             .scope = lifecycle.scope,
@@ -514,12 +515,15 @@ pub fn applyPostToolUse(
         .tool_name = call.name,
         .arguments_json = call.arguments_json,
         .output = execution.model_output,
+        .tool_failed = tool_failed,
     });
     defer outcome.deinit(lifecycle.outcome_allocator);
     switch (outcome) {
         .unchanged => {},
         .replaced => |replaced| {
-            execution.model_output = if (replaced.failed)
+            // A failed call's output already has the tool's own failure
+            // shape, so its replacement is used as given.
+            execution.model_output = if (replaced.failed and !tool_failed)
                 try tool_result_errors.toolExecutionFailureJson(result_allocator, .{
                     .tool_name = call.name,
                     .message = replaced.output,
@@ -571,10 +575,12 @@ const PostReplace = struct {
     output: []const u8,
     failed: bool = false,
     calls: usize = 0,
+    saw_failed: bool = false,
 
-    fn run(raw: *anyopaque, _: hooks.PostToolUseInput) hooks.HandlerError!hooks.PostToolUseAction {
+    fn run(raw: *anyopaque, input: hooks.PostToolUseInput) hooks.HandlerError!hooks.PostToolUseAction {
         const self: *@This() = @ptrCast(@alignCast(raw));
         self.calls += 1;
+        self.saw_failed = input.tool_failed;
         return .{ .replace_output = .{ .output = self.output, .failed = self.failed } };
     }
 };
@@ -602,10 +608,18 @@ test "applyPostToolUse replaces successful output and clears stored memory" {
     try std.testing.expect(execution.status == .success);
     try std.testing.expect(execution.tool_result_memory == null);
 
-    var failed_execution = tool_contracts.ToolExecutionResult{ .model_output = "{}", .status = .failure };
+    try std.testing.expect(!handler.saw_failed);
+
+    var failed_execution = tool_contracts.ToolExecutionResult{ .model_output = "{\"exit_code\":3}", .status = .failure };
     try applyPostToolUse(arena, context, 1, 0, call, &failed_execution);
-    try std.testing.expectEqualStrings("{}", failed_execution.model_output);
-    try std.testing.expectEqual(@as(usize, 1), handler.calls);
+    try std.testing.expect(handler.saw_failed);
+    try std.testing.expectEqualStrings("1\tchanged", failed_execution.model_output);
+    try std.testing.expect(failed_execution.status == .failure);
+
+    var cancelled = tool_contracts.ToolExecutionResult{ .model_output = "{}", .status = .failure, .cancelled = true };
+    try applyPostToolUse(arena, context, 1, 0, call, &cancelled);
+    try std.testing.expectEqualStrings("{}", cancelled.model_output);
+    try std.testing.expectEqual(@as(usize, 2), handler.calls);
 }
 
 test "applyPostToolUse turns a failed replacement into the tool failure shape" {
