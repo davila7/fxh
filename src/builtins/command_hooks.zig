@@ -12,6 +12,7 @@
 //! that is not JSON leaves the call as it was.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const hooks = @import("../core/hooks/hooks.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -23,6 +24,8 @@ const max_settings_bytes = 4 * 1024 * 1024;
 const max_command_output_bytes = hooks.Limits.output_bytes + 64 * 1024;
 const default_timeout_seconds: u64 = 60;
 const default_deny_reason = "Tool call was not allowed";
+// Commands need a child process and a stdin writer thread; WASM builds have neither.
+const supported = !builtin.single_threaded and builtin.os.tag != .wasi;
 
 pub const pre_tool_use_handler_name = "fx.command_hooks.pre_tool_use";
 pub const post_tool_use_handler_name = "fx.command_hooks.post_tool_use";
@@ -84,6 +87,7 @@ pub const CommandHooks = struct {
 /// not be frozen yet. Returns the owned hooks, or null when none are set; the
 /// caller frees them with `destroy` after the runtime is gone.
 pub fn loadAndRegister(alloc: Allocator, runtime: *hooks.Runtime) !?*CommandHooks {
+    if (comptime !supported) return null;
     var loaded = (try loadUserCommandHooks(alloc)) orelse return null;
     if (loaded.isEmpty()) {
         loaded.deinit();
@@ -342,6 +346,10 @@ const StdinWriter = struct {
 /// Runs `/bin/sh -c <command>` in the workspace. Returns null when the
 /// command could not start, timed out, or was killed by a signal.
 fn runCommand(arena: Allocator, command: Command, cwd: []const u8, payload: []const u8) ?CommandResult {
+    if (comptime !supported) return null else return runChild(arena, command, cwd, payload);
+}
+
+fn runChild(arena: Allocator, command: Command, cwd: []const u8, payload: []const u8) ?CommandResult {
     const io = io_mod.getIo();
     var child = std.process.spawn(io, .{
         .argv = &.{ "/bin/sh", "-c", command.command },
