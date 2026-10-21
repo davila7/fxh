@@ -1,3 +1,4 @@
+// Modified for fxh (fork of vercel-labs/fx): PostToolUse dispatch and the PreToolUse fail action.
 const std = @import("std");
 const definitions = @import("definitions.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -21,6 +22,14 @@ const RegisteredPreToolUseHandler = struct {
     ) definitions.HandlerError!definitions.PreToolUseAction,
 };
 
+const RegisteredPostToolUseHandler = struct {
+    hook: RegisteredHook,
+    run: *const fn (
+        ctx: *anyopaque,
+        input: definitions.PostToolUseInput,
+    ) definitions.HandlerError!definitions.PostToolUseAction,
+};
+
 const RegisteredStopHandler = struct {
     hook: RegisteredHook,
     run: *const fn (
@@ -42,6 +51,7 @@ const RegisteredAttentionRequiredHandler = RegisteredSideEffectHandler(definitio
 pub const Runtime = struct {
     alloc: Allocator,
     pre_tool_use_handlers: std.ArrayList(RegisteredPreToolUseHandler) = .empty,
+    post_tool_use_handlers: std.ArrayList(RegisteredPostToolUseHandler) = .empty,
     stop_handlers: std.ArrayList(RegisteredStopHandler) = .empty,
     post_turn_end_handlers: std.ArrayList(RegisteredPostTurnEndHandler) = .empty,
     attention_required_handlers: std.ArrayList(RegisteredAttentionRequiredHandler) = .empty,
@@ -54,6 +64,8 @@ pub const Runtime = struct {
     pub fn deinit(self: *Runtime) void {
         deinitRegisteredHooks(self.alloc, self.pre_tool_use_handlers.items);
         self.pre_tool_use_handlers.deinit(self.alloc);
+        deinitRegisteredHooks(self.alloc, self.post_tool_use_handlers.items);
+        self.post_tool_use_handlers.deinit(self.alloc);
         deinitRegisteredHooks(self.alloc, self.stop_handlers.items);
         self.stop_handlers.deinit(self.alloc);
         deinitRegisteredHooks(self.alloc, self.post_turn_end_handlers.items);
@@ -76,6 +88,24 @@ pub const Runtime = struct {
         const hook = try self.copyHook(.pre_tool_use, handler.name, handler.ctx);
         errdefer self.alloc.free(hook.name);
         try self.pre_tool_use_handlers.append(self.alloc, .{
+            .hook = hook,
+            .run = handler.run,
+        });
+    }
+
+    pub fn registerPostToolUse(
+        self: *Runtime,
+        handler: definitions.PostToolUseHandler,
+    ) (Allocator.Error || definitions.RegistrationError)!void {
+        try self.validateRegistration(
+            .post_tool_use,
+            handler.name,
+            self.post_tool_use_handlers.items,
+        );
+
+        const hook = try self.copyHook(.post_tool_use, handler.name, handler.ctx);
+        errdefer self.alloc.free(hook.name);
+        try self.post_tool_use_handlers.append(self.alloc, .{
             .hook = hook,
             .run = handler.run,
         });
@@ -149,6 +179,7 @@ pub const Runtime = struct {
     fn currentView(self: *const Runtime) RuntimeView {
         return .{
             .pre_tool_use_handlers = self.pre_tool_use_handlers.items,
+            .post_tool_use_handlers = self.post_tool_use_handlers.items,
             .stop_handlers = self.stop_handlers.items,
             .post_turn_end_handlers = self.post_turn_end_handlers.items,
             .attention_required_handlers = self.attention_required_handlers.items,
@@ -185,6 +216,7 @@ pub const Runtime = struct {
 
 pub const RuntimeView = struct {
     pre_tool_use_handlers: []const RegisteredPreToolUseHandler,
+    post_tool_use_handlers: []const RegisteredPostToolUseHandler = &.{},
     stop_handlers: []const RegisteredStopHandler,
     post_turn_end_handlers: []const RegisteredPostTurnEndHandler,
     attention_required_handlers: []const RegisteredAttentionRequiredHandler,
@@ -192,6 +224,7 @@ pub const RuntimeView = struct {
     pub fn empty() RuntimeView {
         return .{
             .pre_tool_use_handlers = &.{},
+            .post_tool_use_handlers = &.{},
             .stop_handlers = &.{},
             .post_turn_end_handlers = &.{},
             .attention_required_handlers = &.{},
@@ -215,6 +248,53 @@ pub const RuntimeView = struct {
         };
         errdefer dispatch.deinit();
         return try dispatch.run(self.pre_tool_use_handlers);
+    }
+
+    pub fn hasPostToolUse(self: RuntimeView) bool {
+        return self.post_tool_use_handlers.len != 0;
+    }
+
+    /// Runs every handler in registration order, each seeing the output the
+    /// previous one produced. A failing handler leaves the output as it was:
+    /// the tool already ran, so there is nothing left to hold back.
+    pub fn runPostToolUse(
+        self: RuntimeView,
+        alloc: Allocator,
+        input: definitions.PostToolUseInput,
+    ) Allocator.Error!definitions.PostToolUseOutcome {
+        if (self.post_tool_use_handlers.len == 0) return .unchanged;
+
+        var current: ?[]u8 = null;
+        errdefer if (current) |output| alloc.free(output);
+        var failed = false;
+        for (self.post_tool_use_handlers) |handler| {
+            var handler_input = input;
+            if (current) |output| handler_input.output = output;
+            const trace = HandlerTrace.start(handler.hook, input.invocation, input.call_id);
+            const action = handler.run(handler.hook.ctx, handler_input) catch |err| {
+                trace.fail(err);
+                continue;
+            };
+            switch (action) {
+                .continue_ => trace.finish("continue"),
+                .replace_output => |replaced| {
+                    if (replaced.output.len > definitions.Limits.output_bytes or
+                        !std.unicode.utf8ValidateSlice(replaced.output))
+                    {
+                        trace.finish("invalid_replace");
+                        continue;
+                    }
+                    const copied = try alloc.dupe(u8, replaced.output);
+                    if (current) |previous| alloc.free(previous);
+                    current = copied;
+                    failed = replaced.failed;
+                    trace.finish(if (replaced.failed) "replace_failed" else "replace");
+                    if (replaced.failed) break;
+                },
+            }
+        }
+        if (current) |output| return .{ .replaced = .{ .output = output, .failed = failed } };
+        return .unchanged;
     }
 
     pub fn hasStop(self: RuntimeView) bool {
@@ -276,6 +356,7 @@ const PreToolUseDispatch = struct {
             switch (try self.runHandler(handler)) {
                 .next => {},
                 .blocked => |reason| return .{ .blocked = reason },
+                .failed => |message| return .{ .failed = message },
             }
         }
 
@@ -324,6 +405,7 @@ const PreToolUseDispatch = struct {
 const PreToolUseActionResult = union(enum) {
     next,
     blocked: []u8,
+    failed: []u8,
 };
 
 fn applyPreToolUseAction(
@@ -378,6 +460,27 @@ fn applyPreToolUseAction(
             }
             trace.finish("block");
             return .{ .blocked = reason };
+        },
+        .fail => |borrowed| {
+            if (borrowed.len == 0 or !std.unicode.utf8ValidateSlice(borrowed)) {
+                trace.finish("invalid_fail");
+                return error.InvalidHandlerOutput;
+            }
+            if (borrowed.len > definitions.Limits.reason_bytes) {
+                trace.finish("fail_too_large");
+                return error.HandlerOutputTooLarge;
+            }
+
+            const message = alloc.dupe(u8, borrowed) catch {
+                trace.finish("copy_failed");
+                return error.OutOfMemory;
+            };
+            if (current_arguments.*) |previous| {
+                alloc.free(previous);
+                current_arguments.* = null;
+            }
+            trace.finish("fail");
+            return .{ .failed = message };
         },
     }
 }
@@ -717,7 +820,6 @@ test "runtime validates names owns copies freezes and exposes lifecycle events" 
     try std.testing.expect(!@hasDecl(Runtime, "registerSessionStart"));
     try std.testing.expect(!@hasDecl(Runtime, "registerUserPromptSubmit"));
     try std.testing.expect(!@hasDecl(Runtime, "registerPermissionRequest"));
-    try std.testing.expect(!@hasDecl(Runtime, "registerPostToolUse"));
     try std.testing.expect(!@hasDecl(Runtime, "registerPostToolFailure"));
 }
 
@@ -1248,4 +1350,120 @@ test "a frozen view is safe to copy across concurrent invocations" {
 
     try std.testing.expect(!failed.load(.seq_cst));
     try std.testing.expectEqual(@as(usize, 2), handler.calls.load(.seq_cst));
+}
+
+const PostOutputHandler = struct {
+    output: []const u8 = "",
+    action: enum { keep, replace, fail, err } = .replace,
+    seen_buffer: [32]u8 = undefined,
+    seen_len: usize = 0,
+    calls: usize = 0,
+
+    fn seen(self: *const PostOutputHandler) []const u8 {
+        return self.seen_buffer[0..self.seen_len];
+    }
+
+    fn run(raw: *anyopaque, input: definitions.PostToolUseInput) definitions.HandlerError!definitions.PostToolUseAction {
+        const self: *PostOutputHandler = @ptrCast(@alignCast(raw));
+        if (self.calls == 0) {
+            self.seen_len = @min(input.output.len, self.seen_buffer.len);
+            @memcpy(self.seen_buffer[0..self.seen_len], input.output[0..self.seen_len]);
+        }
+        self.calls += 1;
+        return switch (self.action) {
+            .keep => .continue_,
+            .replace => .{ .replace_output = .{ .output = self.output } },
+            .fail => .{ .replace_output = .{ .output = self.output, .failed = true } },
+            .err => error.Failed,
+        };
+    }
+};
+
+fn testPostInput(output: []const u8) definitions.PostToolUseInput {
+    return .{
+        .invocation = testInvocation(),
+        .step_index = 1,
+        .call_id = "call",
+        .tool_name = "read_file",
+        .arguments_json = "{}",
+        .output = output,
+    };
+}
+
+test "PostToolUse chains replacements and fails open on handler errors" {
+    const alloc = std.testing.allocator;
+    var broken = PostOutputHandler{ .action = .err };
+    var first = PostOutputHandler{ .output = "first" };
+    var second = PostOutputHandler{ .output = "second" };
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    try runtime.registerPostToolUse(.{ .name = "broken", .ctx = &broken, .run = PostOutputHandler.run });
+    try runtime.registerPostToolUse(.{ .name = "first", .ctx = &first, .run = PostOutputHandler.run });
+    try runtime.registerPostToolUse(.{ .name = "second", .ctx = &second, .run = PostOutputHandler.run });
+    const view = runtime.freeze();
+    try std.testing.expect(view.hasPostToolUse());
+    var outcome = try view.runPostToolUse(alloc, testPostInput("original"));
+    defer outcome.deinit(alloc);
+
+    try std.testing.expect(outcome == .replaced);
+    try std.testing.expectEqualStrings("second", outcome.replaced.output);
+    try std.testing.expect(!outcome.replaced.failed);
+    try std.testing.expectEqualStrings("original", first.seen());
+    try std.testing.expectEqualStrings("first", second.seen());
+}
+
+test "PostToolUse stops at the first failed replacement" {
+    const alloc = std.testing.allocator;
+    var failing = PostOutputHandler{ .output = "Error: connection reset", .action = .fail };
+    var never = PostOutputHandler{ .output = "never" };
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    try runtime.registerPostToolUse(.{ .name = "fail", .ctx = &failing, .run = PostOutputHandler.run });
+    try runtime.registerPostToolUse(.{ .name = "never", .ctx = &never, .run = PostOutputHandler.run });
+    var outcome = try runtime.freeze().runPostToolUse(alloc, testPostInput("ok"));
+    defer outcome.deinit(alloc);
+
+    try std.testing.expect(outcome == .replaced);
+    try std.testing.expect(outcome.replaced.failed);
+    try std.testing.expectEqualStrings("Error: connection reset", outcome.replaced.output);
+    try std.testing.expectEqual(@as(usize, 0), never.calls);
+}
+
+test "PostToolUse keeps the output when handlers continue or return invalid text" {
+    const alloc = std.testing.allocator;
+    var keep = PostOutputHandler{ .action = .keep };
+    var invalid = PostOutputHandler{ .output = "\xff\xfe" };
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    try runtime.registerPostToolUse(.{ .name = "keep", .ctx = &keep, .run = PostOutputHandler.run });
+    try runtime.registerPostToolUse(.{ .name = "invalid", .ctx = &invalid, .run = PostOutputHandler.run });
+    var outcome = try runtime.freeze().runPostToolUse(alloc, testPostInput("ok"));
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome == .unchanged);
+    try std.testing.expect(RuntimeView.empty().runPostToolUse(alloc, testPostInput("ok")) catch unreachable == .unchanged);
+}
+
+const FailToolHandler = struct {
+    fn run(_: *anyopaque, _: definitions.PreToolUseInput) definitions.HandlerError!definitions.PreToolUseAction {
+        return .{ .fail = "EACCES: permission denied" };
+    }
+};
+
+test "PreToolUse fail returns an owned message and stops the chain" {
+    const alloc = std.testing.allocator;
+    var unused: u8 = 0;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    try runtime.registerPreToolUse(.{ .name = "fail", .ctx = &unused, .run = FailToolHandler.run });
+    try runtime.registerPreToolUse(.{ .name = "after", .ctx = &unused, .run = TestHandler.continueTool });
+    var outcome = try runtime.freeze().runPreToolUse(alloc, .{
+        .invocation = testInvocation(),
+        .step_index = 1,
+        .call_id = "call",
+        .tool_name = "shell",
+        .arguments_json = "{}",
+    });
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome == .failed);
+    try std.testing.expectEqualStrings("EACCES: permission denied", outcome.failed);
 }

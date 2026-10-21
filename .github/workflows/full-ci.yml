@@ -5,6 +5,8 @@ on:
   push:
     branches-ignore:
       - main
+      # fxh: fork branches build with fxh-release.yml instead.
+      - 'cmca/**'
 
 concurrency:
   group: full-ci-${{ github.ref }}

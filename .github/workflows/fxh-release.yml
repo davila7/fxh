@@ -1,0 +1,64 @@
+# fxh (fork of vercel-labs/fx): builds the linux x86_64 binary the way the
+# upstream release does, runs the hook tests, and publishes a GitHub release.
+name: fxh release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to create, for example v0.0.13-h1
+        required: true
+        type: string
+  push:
+    branches: ['cmca/**']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: "0.16.0"
+
+      - name: Hook tests
+        run: zig build test -Dtest-filter=hooks -Dtest-filter=PostToolUse -Dtest-filter=lifecycle -Dtest-filter=tool_flow -Dtest-filter=parallel -Dtest-filter=cli_ask
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux
+
+      - name: Package
+        run: |
+          tag="${{ inputs.tag }}"
+          name="fxh-${tag:-dev}-linux-x86_64"
+          package_dir="$RUNNER_TEMP/$name"
+          mkdir -p "$package_dir"
+          cp zig-out/bin/fx "$package_dir/fxh"
+          cp LICENSE THIRD_PARTY_NOTICES.md FORK.md "$package_dir/"
+          tar -czf "$name.tar.gz" -C "$RUNNER_TEMP" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          sha256sum "$package_dir/fxh" >> "$GITHUB_STEP_SUMMARY"
+          cat "$name.tar.gz.sha256" >> "$GITHUB_STEP_SUMMARY"
+          echo "ARCHIVE=$name.tar.gz" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fxh-linux-x86_64
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
+
+      - name: Publish release
+        if: inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ inputs.tag }}" "$ARCHIVE" "$ARCHIVE.sha256" \
+            --target "$GITHUB_SHA" \
+            --title "fxh ${{ inputs.tag }}" \
+            --notes-file FORK.md

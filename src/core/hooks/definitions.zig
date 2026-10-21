@@ -1,3 +1,4 @@
+// Modified for fxh (fork of vercel-labs/fx): PostToolUse and the PreToolUse fail action.
 const std = @import("std");
 const types = @import("../shared/types.zig");
 
@@ -6,10 +7,12 @@ pub const HookKind = enum {
     stop,
     post_turn_end,
     attention_required,
+    post_tool_use,
 
     pub fn definition(self: HookKind) HookDefinition {
         return switch (self) {
             .pre_tool_use => pre_tool_use,
+            .post_tool_use => post_tool_use,
             .stop => stop,
             .post_turn_end => post_turn_end,
             .attention_required => attention_required,
@@ -52,11 +55,19 @@ pub const attention_required = HookDefinition{
     .purpose = "lets handlers observe when a foreground turn is waiting for user attention",
 };
 
+pub const post_tool_use = HookDefinition{
+    .kind = .post_tool_use,
+    .lifecycle_event = "PostToolUse",
+    .agent_loop_point = "after a local tool call succeeds, before its output enters the conversation",
+    .purpose = "lets handlers keep the output or replace it, optionally as a failed result",
+};
+
 pub const all_hooks = [_]HookDefinition{
     pre_tool_use,
     stop,
     post_turn_end,
     attention_required,
+    post_tool_use,
 };
 
 pub const ScopeKind = enum {
@@ -83,6 +94,7 @@ pub const Limits = struct {
     pub const reason_bytes = 4 * 1024;
     pub const context_bytes = 64 * 1024;
     pub const arguments_json_bytes = 1024 * 1024;
+    pub const output_bytes = 4 * 1024 * 1024;
 };
 
 pub const RegistrationError = error{
@@ -122,17 +134,21 @@ pub const PreToolUseAction = union(enum) {
     continue_,
     rewrite_arguments: []const u8,
     block: []const u8,
+    /// Reports the call as a failed tool result with this message, without
+    /// running it and without the retry guidance that `block` adds.
+    fail: []const u8,
 };
 
 pub const PreToolUseOutcome = union(enum) {
     unchanged,
     rewritten: []u8,
     blocked: []u8,
+    failed: []u8,
 
     pub fn deinit(self: *PreToolUseOutcome, alloc: std.mem.Allocator) void {
         switch (self.*) {
             .rewritten => |arguments_json| alloc.free(arguments_json),
-            .blocked => |reason| alloc.free(reason),
+            .blocked, .failed => |reason| alloc.free(reason),
             .unchanged => {},
         }
         self.* = .unchanged;
@@ -146,6 +162,53 @@ pub const PreToolUseHandler = struct {
         ctx: *anyopaque,
         input: PreToolUseInput,
     ) HandlerError!PreToolUseAction,
+};
+
+pub const PostToolUseInput = struct {
+    invocation: Invocation,
+    step_index: usize,
+    call_id: []const u8,
+    tool_name: []const u8,
+    arguments_json: []const u8,
+    output: []const u8,
+    /// The call ran and reported a failure, such as a command that exited
+    /// non-zero. A replacement keeps the call failed.
+    tool_failed: bool = false,
+};
+
+pub const ReplacedToolOutput = struct {
+    output: []const u8,
+    failed: bool = false,
+};
+
+pub const PostToolUseAction = union(enum) {
+    continue_,
+    replace_output: ReplacedToolOutput,
+};
+
+pub const PostToolUseOutcome = union(enum) {
+    unchanged,
+    replaced: struct {
+        output: []u8,
+        failed: bool,
+    },
+
+    pub fn deinit(self: *PostToolUseOutcome, alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .replaced => |replaced| alloc.free(replaced.output),
+            .unchanged => {},
+        }
+        self.* = .unchanged;
+    }
+};
+
+pub const PostToolUseHandler = struct {
+    name: []const u8,
+    ctx: *anyopaque,
+    run: *const fn (
+        ctx: *anyopaque,
+        input: PostToolUseInput,
+    ) HandlerError!PostToolUseAction,
 };
 
 pub const StopInput = struct {
@@ -219,11 +282,16 @@ pub const AttentionRequiredHandler = struct {
 };
 
 test "hook definitions enumerate current hook surfaces" {
-    try std.testing.expectEqual(@as(usize, 4), all_hooks.len);
+    try std.testing.expectEqual(@as(usize, 5), all_hooks.len);
     try std.testing.expectEqual(HookKind.pre_tool_use, all_hooks[0].kind);
     try std.testing.expectEqual(HookKind.stop, all_hooks[1].kind);
     try std.testing.expectEqual(HookKind.post_turn_end, all_hooks[2].kind);
     try std.testing.expectEqual(HookKind.attention_required, all_hooks[3].kind);
+    try std.testing.expectEqual(HookKind.post_tool_use, all_hooks[4].kind);
+    try std.testing.expectEqualStrings("PostToolUse", post_tool_use.lifecycle_event);
+    try std.testing.expectEqual(HookKind.post_tool_use, HookKind.post_tool_use.definition().kind);
+    try std.testing.expect(post_tool_use.agent_loop_point.len > 0);
+    try std.testing.expect(post_tool_use.purpose.len > 0);
     try std.testing.expectEqualStrings("PreToolUse", pre_tool_use.lifecycle_event);
     try std.testing.expectEqualStrings("Stop", stop.lifecycle_event);
     try std.testing.expectEqualStrings("PostTurnEnd", post_turn_end.lifecycle_event);

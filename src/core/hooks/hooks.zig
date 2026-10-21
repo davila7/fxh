@@ -1,3 +1,4 @@
+// Modified for fxh (fork of vercel-labs/fx): PostToolUse exports.
 pub const common = @import("common.zig");
 pub const definitions = @import("definitions.zig");
 pub const prompt = @import("prompt.zig");
@@ -9,6 +10,7 @@ pub const pre_tool_use = definitions.pre_tool_use;
 pub const stop = definitions.stop;
 pub const post_turn_end = definitions.post_turn_end;
 pub const attention_required = definitions.attention_required;
+pub const post_tool_use = definitions.post_tool_use;
 
 pub const HandlerError = definitions.HandlerError;
 pub const Invocation = definitions.Invocation;
@@ -38,3 +40,9 @@ pub const PreToolUseAction = definitions.PreToolUseAction;
 pub const PreToolUseHandler = definitions.PreToolUseHandler;
 pub const PreToolUseInput = definitions.PreToolUseInput;
 pub const PreToolUseOutcome = definitions.PreToolUseOutcome;
+
+pub const PostToolUseAction = definitions.PostToolUseAction;
+pub const PostToolUseHandler = definitions.PostToolUseHandler;
+pub const PostToolUseInput = definitions.PostToolUseInput;
+pub const PostToolUseOutcome = definitions.PostToolUseOutcome;
+pub const ReplacedToolOutput = definitions.ReplacedToolOutput;
