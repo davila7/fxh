@@ -1,3 +1,4 @@
+// Modified for fxh (fork of vercel-labs/fx): registers command hooks.
 const std = @import("std");
 const std_builtin = @import("builtin");
 const command_admission = @import("../permissions/command_admission.zig");
@@ -30,6 +31,7 @@ const http_pool = @import("../shared/http_pool.zig");
 const gateway_client = @import("../../gateway/client.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const hooks = @import("../hooks/hooks.zig");
+const command_hooks = @import("../../builtins/command_hooks.zig");
 const notification_sound = @import("../notifications/sound.zig");
 const io_mod = @import("../shared/io.zig");
 const shell_snapshot = @import("../terminal/shell_snapshot.zig");
@@ -659,6 +661,7 @@ const AskContext = struct {
     capability_resolver: gateway_provider.CapabilityResolver = .{},
     lifecycle_runtime: hooks.Runtime,
     lifecycle_view: hooks.RuntimeView,
+    command_hooks: ?*command_hooks.CommandHooks = null,
     active_turn_id: u64 = 0,
     notification_player: ?notification_sound.Player = null,
     image_snapshot_temp_dir: ?[]u8 = null,
@@ -715,6 +718,7 @@ const AskContext = struct {
                 .run = attentionRequiredNotification,
             });
         }
+        self.command_hooks = try command_hooks.loadAndRegister(self.alloc, &self.lifecycle_runtime);
         self.lifecycle_view = self.lifecycle_runtime.freeze();
     }
 
@@ -816,6 +820,8 @@ const AskContext = struct {
         if (self.refreshed_credential) |*credential| credential.deinit(self.alloc);
         self.capability_resolver.deinit(self.alloc);
         self.lifecycle_runtime.deinit();
+        if (self.command_hooks) |owned| command_hooks.destroy(self.alloc, owned);
+        self.command_hooks = null;
         if (self.writable) |*writable| writable.deinit(self.alloc);
         self.writable = null;
         if (self.store) |*store| store.deinit(self.alloc);

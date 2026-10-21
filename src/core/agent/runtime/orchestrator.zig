@@ -1,3 +1,4 @@
+// Modified for fxh (fork of vercel-labs/fx): runs PostToolUse after sequential tool calls.
 const std = @import("std");
 const skill_runtime = @import("../../skills/skill_runtime.zig");
 const skill_contract = @import("../../skills/skill_contract.zig");
@@ -10238,6 +10239,8 @@ fn processQueuedPromptLoop(
                         .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
                         .max_tool_result_bytes = config.max_tool_result_bytes,
                         .classification_complete = executable_classification_complete.items,
+                        .lifecycle = lifecycle,
+                        .step_index = current_step_index,
                     };
                     var completion_publisher = ParallelSubagentCompletionPublisher{
                         .deps = deps,
@@ -11604,6 +11607,7 @@ fn processQueuedPromptLoop(
                 execution_error = err;
                 break :blk ToolExecutionResult{ .status = .failure, .model_output = try deps.format_tool_execution_error(deps.ctx, arena, tool_call.name, err) };
             };
+            try runtime_lifecycle.applyPostToolUse(arena, lifecycle, turn_id, current_step_index, execution_call, &execution);
             var result_commit_pending = execution.result_commit != null;
             defer if (result_commit_pending) {
                 execution.result_commit.?.cancel();

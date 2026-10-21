@@ -1,3 +1,4 @@
+// Modified for fxh (fork of vercel-labs/fx): owns the command hooks.
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -62,6 +63,7 @@ const vercel_model_policy = @import("gateway/vercel_model_policy.zig");
 const model_catalog = @import("core/gateway/model_catalog.zig");
 const agent_stream_provider = @import("core/agent/stream_provider.zig");
 const builtin_hooks = @import("builtins/hooks.zig");
+const builtin_command_hooks = @import("builtins/command_hooks.zig");
 const builtin_mcp = @import("builtins/mcp.zig");
 const builtin_modes = @import("builtins/modes.zig");
 const builtin_skills = @import("builtins/skills.zig");
@@ -537,6 +539,7 @@ const App = struct {
     web_search_models_path: []const u8 = builtin_gateway.models_path,
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
+    command_hooks: ?*builtin_command_hooks.CommandHooks = null,
     notifications: builtin_hooks.notifications.State = .{},
     herdr: builtin_hooks.Client = .{},
 
@@ -996,6 +999,8 @@ const App = struct {
         self.context_snapshot.deinit(self.alloc);
         self.file_index.deinit(std.heap.c_allocator);
         self.lifecycle_runtime.deinit();
+        if (self.command_hooks) |owned| builtin_command_hooks.destroy(self.alloc, owned);
+        self.command_hooks = null;
 
         self.auth.deinit(self.alloc);
         WorkspaceAppRuntime.deinit(self);
@@ -3851,6 +3856,7 @@ test "footer runtime compatibility facade exports composeFooterFrame" {
 test "interactive app keeps notification handlers registered for live preference changes" {
     var app = App{ .alloc = std.testing.allocator };
     defer app.lifecycle_runtime.deinit();
+    defer if (app.command_hooks) |owned| builtin_command_hooks.destroy(app.alloc, owned);
 
     try app.configureNotifications();
 

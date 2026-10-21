@@ -1,3 +1,4 @@
+// Modified for fxh (fork of vercel-labs/fx): runs PostToolUse after parallel tool calls.
 const std = @import("std");
 const skill_contract = @import("../../skills/skill_contract.zig");
 const types = @import("../../shared/types.zig");
@@ -6,6 +7,7 @@ const io_mod = @import("../../shared/io.zig");
 
 const runtime_deps = @import("deps.zig");
 const runtime_tool_contracts = @import("tool_contracts.zig");
+const runtime_lifecycle = @import("lifecycle.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
@@ -100,6 +102,8 @@ pub const ParallelHookExecContext = struct {
     advertised_dynamic_tool_names: []const []const u8,
     max_tool_result_bytes: usize,
     classification_complete: []const bool = &.{},
+    lifecycle: ?runtime_lifecycle.LifecycleContext = null,
+    step_index: usize = 0,
 };
 
 const ParallelExecuteFn = *const fn (*anyopaque, Allocator, ToolCall, usize) anyerror!ToolExecutionResult;
@@ -332,7 +336,7 @@ fn cancelRequested(cancel_flag: ?*std.atomic.Value(bool)) bool {
 
 pub fn parallelHookExecute(ctx: *anyopaque, alloc: Allocator, call: ToolCall, index: usize) !ToolExecutionResult {
     const exec_ctx: *ParallelHookExecContext = @ptrCast(@alignCast(ctx));
-    return exec_ctx.hooks.execute_tool_call(exec_ctx.hooks.ctx, .{
+    var execution = try exec_ctx.hooks.execute_tool_call(exec_ctx.hooks.ctx, .{
         .skill_locations = exec_ctx.skill_locations,
         .call_allocator = alloc,
         .result_allocator = alloc,
@@ -348,6 +352,13 @@ pub fn parallelHookExecute(ctx: *anyopaque, alloc: Allocator, call: ToolCall, in
             exec_ctx.classification_complete[index],
         .lifecycle_id = .{ .turn_id = exec_ctx.turn_id, .call_id = call.id },
     });
+    if (exec_ctx.lifecycle) |shared| {
+        // Calls in a group run on worker threads; each uses its own allocator.
+        var lifecycle = shared;
+        lifecycle.outcome_allocator = alloc;
+        try runtime_lifecycle.applyPostToolUse(alloc, lifecycle, exec_ctx.turn_id, exec_ctx.step_index, call, &execution);
+    }
+    return execution;
 }
 
 pub fn parallelHookFormatError(ctx: *anyopaque, alloc: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {

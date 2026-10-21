@@ -1,7 +1,9 @@
+// Modified for fxh (fork of vercel-labs/fx): PostToolUse dispatch and the PreToolUse fail action.
 const std = @import("std");
 const hooks = @import("../../hooks/hooks.zig");
 const types = @import("../../shared/types.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
+const tool_contracts = @import("tool_contracts.zig");
 
 const Allocator = std.mem.Allocator;
 const ToolCall = types.ToolCall;
@@ -45,6 +47,7 @@ const PreToolUseCheckpoint = struct {
 pub const PreparedToolBlockKind = enum {
     malformed_arguments,
     lifecycle_block,
+    lifecycle_fail,
     lifecycle_failed_closed,
     route_unavailable,
     required_vision,
@@ -430,6 +433,12 @@ fn preparedCallFromPreToolUseOutcome(
             .lifecycle_block,
             reason,
         ),
+        .failed => |message| try makePreparedBlocked(
+            alloc,
+            call,
+            .lifecycle_fail,
+            message,
+        ),
     };
 }
 
@@ -464,6 +473,10 @@ fn makePreparedBlocked(
             call.name,
             reason.?,
         ),
+        .lifecycle_fail => try tool_result_errors.toolExecutionFailureJson(alloc, .{
+            .tool_name = call.name,
+            .message = reason.?,
+        }),
         .lifecycle_failed_closed => try tool_result_errors.preToolUseFailedClosedJson(
             alloc,
             call.name,
@@ -475,6 +488,51 @@ fn makePreparedBlocked(
         .model_output = model_output,
         .kind = kind,
     } };
+}
+
+/// Runs PostToolUse handlers on a call that ran and succeeded, and applies a
+/// replacement to `execution`. A failed replacement becomes the standard tool
+/// failure shape, so the model sees it as it would see any other failed call.
+pub fn applyPostToolUse(
+    result_allocator: Allocator,
+    lifecycle: LifecycleContext,
+    turn_id: u64,
+    step_index: usize,
+    call: ToolCall,
+    execution: *tool_contracts.ToolExecutionResult,
+) Allocator.Error!void {
+    if (!lifecycle.view.hasPostToolUse()) return;
+    if (execution.cancelled or execution.status != .success) return;
+    if (execution.model_content_kind != .ordinary) return;
+    var outcome = try lifecycle.view.runPostToolUse(lifecycle.outcome_allocator, .{
+        .invocation = .{
+            .scope = lifecycle.scope,
+            .turn_id = turn_id,
+        },
+        .step_index = step_index,
+        .call_id = call.id,
+        .tool_name = call.name,
+        .arguments_json = call.arguments_json,
+        .output = execution.model_output,
+    });
+    defer outcome.deinit(lifecycle.outcome_allocator);
+    switch (outcome) {
+        .unchanged => {},
+        .replaced => |replaced| {
+            execution.model_output = if (replaced.failed)
+                try tool_result_errors.toolExecutionFailureJson(result_allocator, .{
+                    .tool_name = call.name,
+                    .message = replaced.output,
+                })
+            else
+                try result_allocator.dupe(u8, replaced.output);
+            if (replaced.failed) execution.status = .failure;
+            // Stored previews and replay handles describe the original
+            // output; keeping them would let the original reach the model.
+            execution.tool_result_memory = null;
+            execution.tool_result_memory_prepared = false;
+        },
+    }
 }
 
 fn cancelRequested(cancel_flag: ?*std.atomic.Value(bool)) bool {
@@ -494,4 +552,79 @@ fn dupeToolCallWithArguments(
     copy.argument_integrity = .valid;
     copy.argument_diagnostic = null;
     return copy;
+}
+
+test "PreToolUse fail reports a plain tool failure without retry guidance" {
+    const alloc = std.testing.allocator;
+    const call = ToolCall{ .id = "c", .name = "shell", .arguments_json = "{}" };
+    var prepared = try makePreparedBlocked(alloc, call, .lifecycle_fail, "Error: resource temporarily unavailable (EAGAIN)");
+    defer prepared.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, prepared.blocked.model_output.?, .{});
+    defer parsed.deinit();
+    const err_obj = parsed.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings("tool_execution_failed", err_obj.get("type").?.string);
+    try std.testing.expectEqualStrings("Error: resource temporarily unavailable (EAGAIN)", err_obj.get("message").?.string);
+    try std.testing.expect(err_obj.get("suggestion") == null);
+}
+
+const PostReplace = struct {
+    output: []const u8,
+    failed: bool = false,
+    calls: usize = 0,
+
+    fn run(raw: *anyopaque, _: hooks.PostToolUseInput) hooks.HandlerError!hooks.PostToolUseAction {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        return .{ .replace_output = .{ .output = self.output, .failed = self.failed } };
+    }
+};
+
+test "applyPostToolUse replaces successful output and clears stored memory" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var handler = PostReplace{ .output = "1\tchanged" };
+    var runtime = hooks.Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+    try runtime.registerPostToolUse(.{ .name = "replace", .ctx = &handler, .run = PostReplace.run });
+    const context = LifecycleContext{
+        .view = runtime.freeze(),
+        .scope = .{ .kind = .ask, .workspace_root = "/fixture" },
+        .outcome_allocator = std.testing.allocator,
+    };
+    const call = ToolCall{ .id = "c", .name = "read_file", .arguments_json = "{}" };
+    var execution = tool_contracts.ToolExecutionResult{
+        .model_output = "1\toriginal",
+        .tool_result_memory = .{ .preview = "1\toriginal" },
+    };
+    try applyPostToolUse(arena, context, 1, 0, call, &execution);
+    try std.testing.expectEqualStrings("1\tchanged", execution.model_output);
+    try std.testing.expect(execution.status == .success);
+    try std.testing.expect(execution.tool_result_memory == null);
+
+    var failed_execution = tool_contracts.ToolExecutionResult{ .model_output = "{}", .status = .failure };
+    try applyPostToolUse(arena, context, 1, 0, call, &failed_execution);
+    try std.testing.expectEqualStrings("{}", failed_execution.model_output);
+    try std.testing.expectEqual(@as(usize, 1), handler.calls);
+}
+
+test "applyPostToolUse turns a failed replacement into the tool failure shape" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var handler = PostReplace{ .output = "Error: connection reset by peer (ECONNRESET)", .failed = true };
+    var runtime = hooks.Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+    try runtime.registerPostToolUse(.{ .name = "fail", .ctx = &handler, .run = PostReplace.run });
+    const context = LifecycleContext{
+        .view = runtime.freeze(),
+        .scope = .{ .kind = .ask, .workspace_root = "/fixture" },
+        .outcome_allocator = std.testing.allocator,
+    };
+    const call = ToolCall{ .id = "c", .name = "write_file", .arguments_json = "{}" };
+    var execution = tool_contracts.ToolExecutionResult{ .model_output = "{\"ok\":true}" };
+    try applyPostToolUse(arena, context, 1, 0, call, &execution);
+    try std.testing.expect(execution.status == .failure);
+    try std.testing.expect(tool_result_errors.isToolExecutionFailedOutput(execution.model_output));
+    try std.testing.expect(std.mem.find(u8, execution.model_output, "ECONNRESET") != null);
 }

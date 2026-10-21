@@ -1,6 +1,8 @@
+// Modified for fxh (fork of vercel-labs/fx): registers command hooks.
 const std = @import("std");
 const agent_runtime = @import("../../core/agent/agent_runtime.zig");
 const hooks = @import("../../core/hooks/hooks.zig");
+const command_hooks = @import("../command_hooks.zig");
 const notification_contract = @import("../../core/notifications/notification_contract.zig");
 const notification_sound = @import("../../core/notifications/sound.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
@@ -133,6 +135,7 @@ fn Runtime(comptime App: type) type {
                 .ctx = app,
                 .run = attentionRequiredHandler,
             });
+            app.command_hooks = try command_hooks.loadAndRegister(app.alloc, &app.lifecycle_runtime);
             app.lifecycle_view = app.lifecycle_runtime.freeze();
         }
 
